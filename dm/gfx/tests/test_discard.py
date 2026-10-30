@@ -4,13 +4,16 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 path = Path(__file__).resolve().parents[1] / 'tools/dmsh_build.py'
-node = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'vs_discard')
-scope = {'re': re}
-exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), 'exec'), scope)
+sys.path.insert(0, str(path.parent))
+import dmsh_abi
+nodes = [n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name in ('vs_discard', 'writes_memory')]
+scope = {'re': re, 'abi': dmsh_abi}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), scope)
 
 SOURCE = '''#include <metal_stdlib>
 using namespace metal;
@@ -25,6 +28,25 @@ vertex main0_out main0(uint n [[vertex_id]], constant Args& a [[buffer(0)]])
     return out;
 }
 '''
+
+
+class WritesMemoryTests(unittest.TestCase):
+    def writes(self, **binding): return scope['writes_memory'](binding)
+
+    def test_storage_buffer_by_its_write_flag(self):
+        self.assertTrue(self.writes(kind=dmsh_abi.KIND_SBUF, rw=True))
+        self.assertFalse(self.writes(kind=dmsh_abi.KIND_SBUF, rw=False))
+
+    def test_image_by_its_msl_access(self):   # Metroid Prime Remastered's fog writer: image stores are the only thing it does
+        self.assertTrue(self.writes(kind=dmsh_abi.KIND_IMG, msl_type='texture3d<float, access::write>'))
+        self.assertTrue(self.writes(kind=dmsh_abi.KIND_IMG, msl_type='texture2d<uint, access::read_write>'))
+        self.assertFalse(self.writes(kind=dmsh_abi.KIND_IMG, msl_type='texture2d<float, access::read>'))
+
+    def test_image_atomics_are_writes(self):
+        self.assertTrue(self.writes(kind=dmsh_abi.KIND_IMG, msl_type='texture2d<uint>', atomic=True))
+
+    def test_a_texture_is_no_write(self):
+        self.assertFalse(self.writes(kind=dmsh_abi.KIND_TEX, msl_type='texture2d<float>'))
 
 
 class DiscardTests(unittest.TestCase):

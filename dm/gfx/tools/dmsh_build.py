@@ -513,6 +513,11 @@ def vs_tf(src, tf, geometry=False):
     return decl + f'\nvertex void main0_tf({params}{extra})\n{{\n' + pro + body.replace('return out;', '{ if (dm_linear < dm_tf.args.x) { ' + ' '.join(stores) + ' } return; }')
 
 
+def writes_memory(b):
+    """A reflected binding the shader writes through: a storage buffer (rw), or an image, by its MSL access as the host reads it (nvn_refl.m). Metroid Prime Remastered's volumetric fog writer is a
+    vertex shader run with rasterizer discard, whose only output is image stores into the fog volume: left out, its draw was skipped and the fog composite multiplied the whole scene by the empty volume"""
+    return bool(b.get('rw') or b.get('atomic') or (b.get('kind') == abi.KIND_IMG and re.search(r'access::(read_)?write', b.get('msl_type', ''))))
+
 def vs_discard(src):
     """Metal requires a void vertex entry when rasterization is disabled.
     Preserve all original side effects and early returns; omit only outputs."""
@@ -716,7 +721,7 @@ def reflect(key, stage, msl, res):
             e['rw'] = bool(b and b['flags'] & 1)   # BufferUsageFlags.Write; Program.cs serializes the translator enum unchanged (atomics count as writes too)
     return binds
 
-DRV_FILL = {0: [(b, b + abi.C0_ROW * abi.C0_SSBO_SLOTS) for b in sorted(SSBO.values())],   # c0: storage buffer address tables (vertex / compute / geometry / pixel)
+DRV_FILL = {0: [(b, b + abi.C0_ROW * abi.C0_SSBO_SLOTS) for b in sorted(SSBO.values())] + [(abi.C0_SAMPLE_TABLE, abi.C0_SAMPLE_MASKS + abi.C0_ROW)],   # c0: storage buffer address tables (vertex / compute / geometry / pixel), and the sample location rows, which read as 0 (sample_table_read)
             2: [(TEX_BASE, SEPTEX_BASE), (IMG_BASE, IMG_BASE + abi.C2_ROW * IMG_SLOTS), (SEPTEX_BASE, SAMP_BASE), (SAMP_BASE, SAMP_BASE + abi.C2_ROW * abi.C2_SEP_SLOTS)]}   # c2: the handle tables above, all filled by the replay layer
 
 def drv_reads(src):
@@ -731,12 +736,17 @@ def drv_reads(src):
         if offs or dyn: out[str(bank)] = {'vec4_offsets': sorted(offs), 'dynamic': dyn}
     return out
 
-def unfillable(dr):
+def sample_table_read(src):
+    """GLSLC's sample location lookup: a byte at c0 + 0x620 + an index computed from the pixel and the sample, with the masks and shifts of the row at c0 + 0x630 (Metroid Prime Remastered: 2,451 pixel
+    shaders). That row reads as 0 here, so the index is 0 and the read stays in the first row of the table, whichever register the computation starts from (the translator's PIXLD writes none)"""
+    return f'+ {abi.C0_SAMPLE_TABLE};' in src and f'fp_c0)._m0[{abi.C0_SAMPLE_MASKS // abi.C0_ROW}]' in src
+
+def unfillable(dr, src=''):
     bad = []
     for bank, d in dr.items():
         # a computed index into c2 reads one of its handle tables, which the replay layer fills whole (nvn_mtl.m DRV2: EA SPORTS FC 27's lights read the separate texture words
-        # at 0x168 + 8i to test each light's handle); c0 is filled only in its tables and words above, so a computed index there may read what the replay does not write
-        if d['dynamic'] and bank == '0': bad.append(f'c{bank} dynamic index')
+        # at 0x168 + 8i to test each light's handle); c0 is filled only in its tables and words above, so a computed index there may read what the replay does not write, unless it is the sample location lookup
+        if d['dynamic'] and bank == '0' and not sample_table_read(src): bad.append(f'c{bank} dynamic index')
         for o in d['vec4_offsets']:
             # a read is a 16-byte row: overlapping any table is enough (Engage reads the c2+0x160 row for texture slot 0 at 0x168 in it)
             if not any(o < b and a < o + 16 for a, b in DRV_FILL[int(bank)]): bad.append(f'c{bank}+{o:#x}')
@@ -1123,7 +1133,7 @@ def finish(key, w, j, c1):
         capture = dmsh_geometry.capture(src)
         src, full = vs_depth(src)
         full += capture
-        discard = any(b.get('rw') for b in reflect(key, 'vs', src, res))
+        discard = any(writes_memory(b) for b in reflect(key, 'vs', src, res))
         if discard: full += vs_discard(src)
         if j.get('tf'): full += vs_tf(src, j['tf'])   # transform feedback capture (see vs_tf)
         plain = full
@@ -1151,7 +1161,7 @@ def finish(key, w, j, c1):
             **({'entry_discard': 'main0_discard'} if discard else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
             **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}),
-            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr),
+            'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, src),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(2)), 'msl_type': m.group(1)} for m in re.finditer(r'(\w+)\s+\w+\s*\[\[attribute\((\d+)\)\]\]', src)],
             'raster': raster_facts(j['stage'], src), 'vs_pad': pad}

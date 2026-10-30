@@ -31,6 +31,8 @@
 #define DMSH_C0_CS_UBO 0x210             // compute: uniform slot r's address and size at 0x210 + 0x10 r, read through global memory (the build's ubo_ptr bindings); it ends where the storage buffer table starts
 #define DMSH_C0_CS_UBO_SLOTS 16          // uniform slots of that table
 #define DMSH_C0_POINT_SIZE 0x610         // graphics stages: the largest point size, to which GLSLC clamps a shader-written gl_PointSize (Super Mario Odyssey's point sprites)
+#define DMSH_C0_SAMPLE_TABLE 0x620       // pixel stage: GLSLC's sample location bytes, read at a computed index (Metroid Prime Remastered); the host leaves them 0: what the driver puts there is not established
+#define DMSH_C0_SAMPLE_MASKS 0x630       // the row of masks and shifts that computes that index from the pixel and the sample; 0 picks the first byte, whatever the pixel
 #define DMSH_C0_BASE_INSTANCE 0x644      // graphics stages: the draw's base instance, which GLSLC adds to Maxwell's instance ID (Pokémon Legends: Z-A's occlusion boxes)
 
 // Binding kinds: the "kind" of each binding in a shader's <key>_b.json, as the build writes it and the host reads it (nvn_refl.m turns each into an NVN_RB_* code, nvn_refl.h)

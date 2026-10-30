@@ -35,7 +35,7 @@
 #   · GFPAK (Game Freak, Pokémon Sword, Pokémon Legends: Arceus): BNSH entries of the archives under bin/archive (Sword's LZ4; Arceus's Oodle Kraken, decoded by the game's own decoder in the Mac host), see gfpak_members
 #   · .tfxo (Silicon Studio's YEBIS post effects, Pokémon Sword): control sections each followed by its code area, in a zlib stream in main, see tfxo_streams and tfxo_shaders
 #   · control sections loose in main, in no GLSLC output or BNSH file (Advance Wars 1+2: Re-Boot Camp's Bink 2 shaders): paired with their code areas by data records or adjacency, see raw_shaders
-#   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its .pak archives
+#   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its .pak archives
 #       and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
 #   · bnd2 (Criterion's Bundle 2, Need for Speed: Hot Pursuit Remastered): whole GLSLC outputs in the zlib resources of SHADERS.BNDL, see bnd2_resources and bnd2_shaders
@@ -779,19 +779,24 @@ def tfxo_streams(d, label):
     return out
 
 RFRM, SNVN = b'RFRM', b'SNVN'
-def rfrm_chunk(d, o):   # a Retro Studios RFRM chunk at o: fourcc, big-endian u64 data length, u32 version, u32 version; its data follows at +0x18
-    return d[o:o + 4], o + 0x18, o + 0x18 + struct.unpack_from('>Q', d, o + 4)[0]
+def rfrm_order(d, o):
+    """The byte order of the RFRM form or chunk at o, from its u64 length at +4: big-endian in Tropical Freeze, little-endian in Metroid Prime Remastered. A length is far below 2^63, so
+    the reading that gives the smaller value is the right one"""
+    return '>' if struct.unpack_from('>Q', d, o + 4)[0] <= struct.unpack_from('<Q', d, o + 4)[0] else '<'
 
-def snvn_records(d, a, b, label):
-    """The program records of an SNVN chunk's data d[a:b]: each a big-endian u32 code length, u32 control length, a byte (0), u32 stream length, then a zlib stream that inflates to
-    exactly the two lengths: every stage's code area back to back, then their control sections in the same order (0x840 bytes each on SDK 4, control +0x704 = its code length).
+def rfrm_chunk(d, o):   # a Retro Studios RFRM chunk at o: fourcc, u64 data length (rfrm_order), u32 version, u32 version; its data follows at +0x18
+    return d[o:o + 4], o + 0x18, o + 0x18 + struct.unpack_from(rfrm_order(d, o) + 'Q', d, o + 4)[0]
+
+def snvn_records(d, a, b, label, order='>'):
+    """The program records of an SNVN chunk's data d[a:b]: each a u32 code length, u32 control length, a byte (0), u32 stream length (in the form's byte order), then a zlib stream that inflates to
+    exactly the two lengths: every stage's code area back to back, then their control sections in the same order (0x840 bytes each on SDK 4, 0x880 on SDK 12, control +0x704 = its code length).
     The tables before the records differ between files (MaterialArchive.arc's SNVN has one of 1,374 (offset, length) pairs, a material's has none), so the records are found by their
     own lengths: a zlib header whose preceding 13 bytes give a stream that ends at exactly that length and inflates to exactly code + control bytes. → [(offset, [(ctl, code), …])]"""
     import zlib
     out, i = [], a + 12
     while (i := d.find(b'\x78', i + 1, b)) >= 0:
-        ncode, nctl, _, nz = struct.unpack_from('>IIBI', d, i - 13)
-        if not (nctl and not nctl % 0x40 and nctl < 1 << 20 and ncode < 1 << 24 and 0 < nz <= b - i): continue
+        ncode, nctl, _, nz = struct.unpack_from(order + 'IIBI', d, i - 13)
+        if not (nctl and not nctl % 4 and nctl < 1 << 20 and ncode < 1 << 24 and 0 < nz <= b - i): continue
         z = zlib.decompressobj()
         try: y = z.decompress(d[i:i + nz])
         except zlib.error: continue
@@ -800,7 +805,9 @@ def snvn_records(d, a, b, label):
         while c < len(y):
             if y[c:c + 4] != CTL_MAGIC: red(f'{label} SNVN record @{i:#x}: no control section at {c:#x}')
             n, nk = struct.unpack_from('<I', y, c + 0x20)[0], struct.unpack_from('<I', y, c + 0x704)[0]
-            stages.append((y[c:c + n], y[k:k + nk])); k += nk; c += n
+            at, extra = struct.unpack_from('<II', y, c + 0x7e8)
+            if at == n: n += extra   # SDK 12: some sections end in a table past their own length (Metroid Prime Remastered: at +0x7e8, +0x7ec bytes, +0x7f0 entries of +0x7f4 bytes), and the next section starts on 16 bytes
+            stages.append((y[c:c + n], y[k:k + nk])); k += nk; c += n + 0xf & ~0xf
         if k != ncode: red(f'{label} SNVN record @{i:#x}: the code areas end at {k:#x}, the control sections start at {ncode:#x}')
         out.append((i, stages)); i += nz - 1
     return out
@@ -812,7 +819,7 @@ def snvn_shaders(d, label):
     out, p = [], d.find(SNVN)
     while p >= 0:
         _, a, b = rfrm_chunk(d, p)
-        for i, stages in snvn_records(d, a, b, label):
+        for i, stages in snvn_records(d, a, b, label, rfrm_order(d, p)):
             for ctl, code in stages:
                 st = glslc_stage(ctl, code)
                 why = check(label, st, ctl, code) if st else 'no stage in the code area'
@@ -849,22 +856,28 @@ def retro_main_forms(d, label):
         if p < 5 or d[p - 5] != 1 or d[p - 4:p - 1] != b'\0\0\0': continue
         head = retro_lzss8(d[p - 1:], 0x20)
         if not head or head[:4] != RFRM or head[0x14:0x18] != b'MTRL': continue
-        x = retro_lzss8(d[p - 1:], 0x20 + struct.unpack_from('>Q', head, 4)[0])
+        x = retro_lzss8(d[p - 1:], 0x20 + struct.unpack_from(rfrm_order(head, 0) + 'Q', head, 4)[0])
         if x: out += snvn_shaders(x, f'{label}@{p - 5:#x}')
     return out
 
 def rfrm_shaders(d, label):
     """A Retro Studios RFRM file: a 'PACK' archive (the .pak files) or a single form (MaterialArchive.arc, an 'MTRL' form). A pack's 'ADIR' chunk lists its resources: u32 count, then
-    36-byte entries {fourcc type, 16-byte GUID, big-endian u64 offset, u64 length}. Only 'MTRL' resources hold shaders (795 in Tropical Freeze's packs): an RFRM form whose data after
-    its 0x20-byte header is a zlib stream, holding an RFRM 'MTRL' form with an SNVN chunk"""
+    entries in the form's byte order: 36 bytes {fourcc type, 16-byte GUID, u64 offset, u64 length} in Tropical Freeze, 52 bytes {fourcc type, 16-byte GUID, u32 version, u32 version, u64 offset,
+    u64 length, u64 inflated length} in Metroid Prime Remastered, where the chunk sits in a 'TOCC' form inside the pack. Only 'MTRL' resources hold shaders (795 in Tropical Freeze's packs):
+    an RFRM form whose data after its 0x20-byte header is a zlib stream, holding an RFRM 'MTRL' form with an SNVN chunk"""
     import zlib
     if d[0x14:0x18] != b'PACK': return snvn_shaders(d, label)
     out, a = [], d.find(b'ADIR', 0x20)
     if a < 0: red(f'{label}: RFRM PACK without an ADIR chunk')
-    for i in range(struct.unpack_from('>I', d, a + 0x18)[0]):
-        e = a + 0x1c + 36 * i
+    order = rfrm_order(d, a)
+    _, s, t = rfrm_chunk(d, a)
+    n = struct.unpack_from(order + 'I', d, s)[0]
+    stride = (t - s - 4) // n if n else 36
+    if stride not in (36, 52): red(f'{label}: ADIR chunk of {t - s} bytes does not hold {n} entries of a known size')
+    for i in range(n):
+        e = s + 4 + stride * i
         if d[e:e + 4] != b'MTRL': continue
-        off, size = struct.unpack_from('>QQ', d, e + 20)
+        off, size = struct.unpack_from(order + 'QQ', d, e + (20 if stride == 36 else 28))
         r = d[off:off + size]
         if r[:4] != RFRM: red(f'{label}: MTRL resource {d[e + 4:e + 20].hex()} is not an RFRM form')
         out += snvn_shaders(zlib.decompress(r[0x20:]) if r[0x20:0x21] == b'\x78' else r, f'{label}/{d[e + 4:e + 20].hex()}')

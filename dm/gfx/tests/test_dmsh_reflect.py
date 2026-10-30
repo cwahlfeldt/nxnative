@@ -81,11 +81,11 @@ class DriverTableArrays(unittest.TestCase):
 
 def builder_unfillable():
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    keep = lambda n: (isinstance(n, ast.FunctionDef) and n.name in ('drv_reads', 'unfillable')) or (isinstance(n, ast.Assign) and any(
+    keep = lambda n: (isinstance(n, ast.FunctionDef) and n.name in ('drv_reads', 'unfillable', 'sample_table_read')) or (isinstance(n, ast.Assign) and any(
         (isinstance(t, ast.Name) and t.id in ('SSBO', 'DRV_FILL')) or (isinstance(t, ast.Tuple) and any(isinstance(e, ast.Name) and e.id == 'TEX_BASE' for e in t.elts)) for t in n.targets))
     ns = {'re': re, 'abi': dmsh_abi}
     exec(compile(ast.Module(body=[n for n in tree.body if keep(n)], type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), ns)
-    return lambda src: ns['unfillable'](ns['drv_reads'](src))
+    return lambda src: ns['unfillable'](ns['drv_reads'](src), src)
 
 
 UNFILLABLE = builder_unfillable()
@@ -100,6 +100,24 @@ class DriverReads(unittest.TestCase):
 
     def test_c2_word_outside_the_tables_is_refused(self):
         self.assertEqual(UNFILLABLE('float x = (*spvDescriptorSet0.fp_c2)._m0[0].x;'), ['c2+0x0'])
+
+    SAMPLE_MASKS = 'int _107 = int(_99) & as_type<int>((*spvDescriptorSet0.fp_c0)._m0[99].w);\n'
+    SAMPLE_READ = 'int _125 = _123 + 1568;\nfloat _133 = (*spvDescriptorSet0.fp_c0)._m0[int(_129)][_131];\n'
+
+    def test_sample_location_lookup_reads_the_zero_rows(self):   # Metroid Prime Remastered: the masks at c0 + 0x630, then a byte at c0 + 0x620 + the index they make
+        self.assertEqual(UNFILLABLE(self.SAMPLE_MASKS + self.SAMPLE_READ), [])
+
+    def test_sample_masks_alone_are_readable(self):   # the same shaders where the translator's constant folding removed the table read
+        self.assertEqual(UNFILLABLE(self.SAMPLE_MASKS), [])
+
+    def test_computed_c0_index_without_the_masks_is_refused(self):
+        self.assertEqual(UNFILLABLE(self.SAMPLE_READ), ['c0 dynamic index'])
+
+    def test_computed_c0_index_from_another_base_is_refused(self):
+        self.assertEqual(UNFILLABLE(self.SAMPLE_MASKS + 'int _125 = _123 + 256;\nfloat _133 = (*spvDescriptorSet0.fp_c0)._m0[int(_129)][_131];\n'), ['c0 dynamic index'])
+
+    def test_a_row_past_the_sample_masks_stays_refused(self):
+        self.assertEqual(UNFILLABLE('float x = (*spvDescriptorSet0.fp_c0)._m0[100].x;'), ['c0+0x640'])
 
 
 if __name__ == '__main__':
