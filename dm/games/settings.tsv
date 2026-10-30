@@ -8,7 +8,8 @@
 #   default   a value (a toggle's: 1 on, 0 off); DM_GAME_<NAME>: the host's own default from the game profile (game_profile.h, game.py); build:<VAR>: the IPA build's setting (build_ipa.sh)
 #             <ios>|<mac> selects the platform's default before resolving a profile macro or build variable
 #   shown     always; DM_GAME_<NAME>!=<value> or ==<value>; fixups:<KEY>: main's rewriter table has that key (a stub in the game's build, patch_nso.py); languages>1; gfxapi:<API>: the packer's GFXAPI;
-#             platform:<ios | mac>: the app's platform (SETTINGS_PLATFORM, ios when unset), for a switch only that platform's front end reads
+#             platform:<ios | mac>: the app's platform (SETTINGS_PLATFORM, ios when unset), for a switch only that platform's front end reads; ! before a condition negates it, & joins conditions that must all hold.
+#             Rows of one variable have conditions that exclude each other (the render scale: down to 50 % through a game's own stub, above 100 % on the Mac through the graphics layer)
 #   section   Game, Controls or Performance: a heading on the single settings screen. Rows appear in table order within each section
 #             Reset to tested defaults clears all launcher choices; values fixed by an env file stay
 #   label, note  the setting's name and the line under it (may be empty; only for a setting with a cost: latency, memory, heat)
@@ -16,7 +17,9 @@
 #             level=basic  a setting a front end shows first;  needs=<VAR>=<value>  a sub-setting, drawn only while the row that sets <VAR> has that value
 DM_FPS_TARGET	choice	30=30 fps,60=60 fps	DM_GAME_FPS_TARGET	DM_GAME_FPS_TARGET!=0	Game	Frame rate		level=basic
 DM_DYNAMIC_RESOLUTION	toggle	-	0	fixups:DYNAMIC_RESOLUTION	Game	Dynamic resolution	Adjusts resolution between 70% and 100% under load. Turn off to keep full resolution for the selected console mode.
-DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	fixups:RENDER_SCALE	Game	Render scale		level=basic
+DM_RENDER_SCALE	range	0.5:1.0:0.05	1.0	platform:ios&fixups:RENDER_SCALE	Game	Render scale		level=basic
+DM_RENDER_SCALE	range	0.5:3.0:0.05	1.0	platform:mac&gfxapi:nvn&fixups:RENDER_SCALE	Game	Render scale	Above 100 % the game renders larger than on the Switch: sharper, and much heavier on the GPU (200 % is four times the pixels).	level=basic
+DM_RENDER_SCALE	range	1.0:3.0:0.25	1.0	platform:mac&gfxapi:nvn&!fixups:RENDER_SCALE	Game	Render scale	Above 100 % the game renders larger than on the Switch: sharper, and much heavier on the GPU (200 % is four times the pixels).	level=basic
 DM_OPMODE	choice	1=Docked,0=Handheld	DM_GAME_OPMODE	always	Game	Console mode		level=basic
 DM_PRESENT_UPSCALE	choice	off=Standard,metalfx=MetalFX	off	always	Game	Upscaling	Uses more GPU time and can increase heat.
 DM_LANG	choice	languages	build:DM_LANG	languages>1	Game	Game language		level=basic

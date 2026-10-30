@@ -64,7 +64,7 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
         self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS'})
         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
-        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN'})   # the Mac window's Display mode (front_mac.m reads 1 or 0)
+        self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_RENDER_SCALE'})   # the Mac window's Display mode (front_mac.m reads 1 or 0), and the render scale above 100 % without the game's stub (these builds' folders have no rewriter table)
         s = mac['DM_FULLSCREEN']
         self.assertEqual((s['kind'], s['default'], s['options'], s['level']), ('choice', '0', [['0', 'Window'], ['1', 'Fullscreen']], 'basic'))
 
@@ -88,6 +88,30 @@ class LauncherSettingsTests(unittest.TestCase):
                 with patch.object(settings, 'HERE', Path(tmp)), patch.object(settings.nacp, 'languages', return_value=['en-US']), \
                         self.assertRaisesRegex(SystemExit, 'platform default'):
                     settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
+
+    def render_scale_row(self, platform, stub, api='nvn'):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']), patch.dict(os.environ, {'GFXAPI': api, 'SETTINGS_PLATFORM': platform}):
+            (Path(tmp) / 'main.fixups.tsv').write_text('# RENDER_SCALE\t1\n' if stub else '')
+            return {s['env']: s for s in settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')['settings']}.get('DM_RENDER_SCALE')
+
+    def test_render_scale_above_100_percent_only_on_the_mac(self):
+        self.assertEqual(self.render_scale_row('ios', True)['max'], 1.0)
+        self.assertIsNone(self.render_scale_row('ios', False), 'on iOS only a game with the stub offers it')
+        mac = self.render_scale_row('mac', True)
+        self.assertEqual((mac['min'], mac['max']), (0.5, 3.0), 'the stub keeps the range below 100 %')
+        mac = self.render_scale_row('mac', False)
+        self.assertEqual((mac['min'], mac['max'], mac['default']), (1.0, 3.0, '1.0'), 'every NVN game above 100 %, off by default')
+        self.assertEqual(mac['level'], 'basic')
+        self.assertIsNone(self.render_scale_row('mac', False, 'vulkan'), 'the host-side scale is NVN only')
+
+    def test_conditions_join_and_negate(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US']), patch.dict(os.environ, {'GFXAPI': 'nvn', 'SETTINGS_PLATFORM': 'mac'}):
+            table = Path(tmp) / 'settings.tsv'
+            table.write_text('DM_A\ttoggle\t-\t0\tplatform:mac&!gfxapi:vulkan\tGame\tA\nDM_B\ttoggle\t-\t0\tplatform:mac&gfxapi:vulkan\tGame\tB\nDM_C\ttoggle\t-\t0\t!platform:ios\tGame\tC\n')
+            (Path(tmp) / 'main.fixups.tsv').write_text('')
+            with patch.object(settings, 'HERE', Path(tmp)):
+                listed = settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
+        self.assertEqual([s['env'] for s in listed['settings']], ['DM_A', 'DM_C'])
 
     def test_meta_fields_and_the_schema_version(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(settings.nacp, 'languages', return_value=['en-US', 'ja']), patch.dict(os.environ, {'GFXAPI': 'nvn'}):

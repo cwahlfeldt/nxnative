@@ -25,7 +25,9 @@ Games whose speed the app controls (Breath of the Wild, Tears of the Kingdom and
 
 ### Render scale
 
-The size of the 3D picture, from 50 to 100 %. Below 100 % the size is fixed there and the game's own dynamic resolution is off; 100 % keeps the game's own. Lower can be lighter on the GPU but is blurrier; the HUD and text keep their sharpness. Only games the app can scale offer it.
+The size of the picture. Below 100 %, down to 50 %, the 3D picture's size is fixed there and the game's own dynamic resolution is off; 100 % keeps the game's own. Lower can be lighter on the GPU but is blurrier; the HUD and text keep their sharpness. Only games the app can scale go below 100 %.
+
+On the Mac, every game drawn through NVN also goes above 100 %, up to 300 %, whatever it renders at on the Switch: the picture and the HUD render larger, which is sharper and much heavier on the GPU (200 % is four times the pixels). The picture still reaches the window at the window's size, so a scale above the screen's own resolution acts as anti-aliasing. [Render scale above the game's own resolution](reference/rendering.md#render-scale-above-the-games-own-resolution) lists what it does not reach.
 
 ### Console mode
 
@@ -213,7 +215,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Setting | Variable | Values |
 |---|---|---|
 | Frame rate | `DM_FPS_TARGET` | `30`, `60` |
-| Render scale | `DM_RENDER_SCALE` | `0.5` to `1.0` |
+| Render scale | `DM_RENDER_SCALE` | `0.5` to `1.0`; on the Mac up to `3.0` |
 | Console mode | `DM_OPMODE` | `1` docked, `0` handheld |
 | Game language | `DM_LANG` | a language code, such as `ja` |
 | Display mode (Mac) | `DM_FULLSCREEN` | `1` fullscreen, `0` a window |
