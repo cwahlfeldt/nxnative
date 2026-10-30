@@ -340,7 +340,10 @@ static NvShader *geo_lean_pick(NvProg *pr, NvShader *gs, int topology, int insta
     if (!(base->geo_lean_tried >> topology & 1)) {
         base->geo_lean_tried |= 1 << topology;
         NSString *key = [[NSString stringWithUTF8String:base->key] substringToIndex:16];
-        base->geo_lean_v[topology] = shader_get([key stringByAppendingFormat:@"_bl%d", topology], 2);
+        // A passthrough shader can also pick each primitive's layer. The lean kernel keeps only the viewport mask and the vertex shader draws, so that layer would be lost: its reader writes it, and the full kernel
+        // and reader stay (Metroid Prime Remastered blends its reflection probes in one draw per level over the six faces of a cube: every face landed on face 0, and whatever those faces light went black)
+        NvShader *reader = shader_get([key stringByAppendingString:@"_bgv"], 0);
+        base->geo_lean_v[topology] = reader && reader->layer_out ? NULL : shader_get([key stringByAppendingFormat:@"_bl%d", topology], 2);
     }
     NvShader *lean = base->geo_lean_v[topology];
     if (!lean || !lean->geo_slot || lean->geo_vertices != (uint32_t)nvn_geo_width(topology) || lean->geo_invocations != 1) return NULL;

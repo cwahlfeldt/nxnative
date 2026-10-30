@@ -173,6 +173,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Fix:** `nvn_tex.c` `level_walk`: a level at least one tile wide, high and deep is laid out with its width padded to whole tiles, the levels from the first smaller one on form the mip tail (packed as usual), and the storage is whole tiles, 64 KB aligned.
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md): laid out unpadded, the 1024×1024 ASTC 6×6 clothes of Hinoa and Minoto (43 GOBs wide instead of 48, level 1 at 0x81000 instead of 0x90000) read 2,183 all-zero blocks in level 0 and 3,043 in level 1, which ASTC decodes as its error colour: their trousers, sleeves and gloves were magenta, worst in Kamura Village.
 
+### Sparse 3D textures take the block height and depth of their 64 KB tile
+
+- **Symptom:** surfaces with no baked light and no direct light on them are black, and appear under a direct light: a game's moving objects (vehicles, the player's arms and weapon, a moving floor), while the static world looks right. No red line.
+- **Cause:** a sparse 3D texture is mapped in 64 KB tiles of a standard shape, and the host gave it the automatic block height and depth of a plain 3D texture (height 1 GOB). The sizes agree either way, so nothing failed: the upload through the page table only put the mapped pages' bytes in the wrong blocks. The game's lighting volumes, of which only a few pages are mapped, then read mostly zero ambient light.
+- **Fix:** `nvn_tex.c` `sparse_tile_3d`: a sparse 3D texture without a packaged layout, at least one tile wide, high and deep, takes its tile's shape: 64×32×32 / 32×32×32 / 32×32×16 / 32×16×16 / 16×16×16 blocks for 1 / 2 / 4 / 8 / 16 bytes per block, so block height 4 / 4 / 4 / 2 / 2 GOBs and depth 32 / 32 / 16 / 16 / 16.
+- **Found on:** Metroid Prime Remastered (`010012101468C000`, no profile yet): its 512×256×368 BC7 and BC1 lighting volumes in virtual pools, one pool each; the gunship in its intro went from a silhouette to its full colours. Located through [PrimeRecomp](https://github.com/gminustwo/primerecomp)'s note on the same symptom (its commit bfcbb4d), which gives the shape; 16 and 8 bytes per block checked here, the others follow the same tile shapes.
+- **Check:** `t_sparse_layout`.
+
 ### Sparse textures take the block height of their 64 KB tile
 
 - **Symptom:** a CPU-filled texture shuffled into a patchwork of rectangles (OCTOPATH TRAVELER's world map on the traveler selection).

@@ -712,6 +712,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** final review of the [NieR geometry integration](../../dm/games/010056B015FE8000/README.md#geometry-optimization-review), against main's existing geometry-feedback implementation; no game-specific condition is involved.
 - **Check:** `t_geometry_feedback` replays actual capture, geometry, compaction, feedback pause/resume and rasterization with GPU readback. Its oracle checks every emitted vertex and saved count, excludes the draw made while paused, and runs with raster discard both enabled and disabled.
 
+### A passthrough geometry shader that picks the layer keeps its full kernel
+
+- **Symptom:** a cube or array target rendered by one draw through a passthrough geometry shader has only its first layer written; `DM_NVN_PASSDUMP` shows no `L` line for its passes, and the raster draw after the geometry draw names the program's own vertex shader instead of `<geometry key>_bgv`. In Metroid Prime Remastered, moving objects (its gunship, arm cannon, Samus) went black or lost their reflections in the zones between two reflection probes, depending on which way their surfaces faced.
+- **Cause:** a passthrough shader cannot change the vertices it passes on, but it can pick each primitive's layer as well as its viewport mask. The lean kernel ([next entry](#passthrough-geometry-shaders-drawn-by-the-vertex-shader)) keeps only the mask and draws with the vertex shader, which writes no layer, so every face landed on layer 0.
+- **Fix:** `geo_lean_pick` (`nvn_geometry.inc`) keeps the full kernel and reader for a shader whose reader `<key>_bgv` writes the layer (`layer_out`); the reader's pass is then layered ([Layered passes](rendering.md#layered-passes-for-vertex-shaders-that-write-the-layer)). No shader changes. A viewport index written the same way would be lost too: not seen, and the host draws viewport 0 only.
+- **Found on:** Metroid Prime Remastered (`010012101468C000`, no profile yet): 7 of its 12 geometry shaders, among them `7eff0a97951e2ec6`, which blends two reflection probes into a 128×128 cube, one draw per mip level. Same cause as in [PrimeRecomp](https://github.com/gminustwo/primerecomp)'s commit 15d1224, which had no geometry stage at all.
+- **Check:** not covered by a test: the decision needs a real shader library. In the game: 8 layered passes of 6 layers each in a frame that blends (`L` lines), and the gunship lit at the spots where it was black.
+
 ### Passthrough geometry shaders drawn by the vertex shader
 
 - **Symptom:** geometry-heavy frames are GPU-bound on the emulation itself. A `DM_NVN_GPUPROF` frame shows, for every geometry draw, a capture pass (`0x0 0c`), a compute encoder and a one-draw reopening of the game's pass, with most of the frame's GPU time in the first two.
