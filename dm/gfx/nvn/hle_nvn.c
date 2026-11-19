@@ -2071,10 +2071,10 @@ __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // Default (Mac)
 __attribute__((weak)) int dm_low_power_now(void) { return 0; }   // Low Power Mode (iOS front_ios.m); off on the Mac
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
-typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms; unsigned pso, lib, up, rup, hy; } lf_rec;   // hy: draws with a hybrid (pulling) pipeline
+typedef struct { uint64_t f; double fr, nv, t_s, make_ms, up_mb, up_ms, held_ms; unsigned pso, lib, up, rup, hy; } lf_rec;   // hy: draws with a hybrid (pulling) pipeline; held_ms: its pipeline lookups held by archive writes
 static lf_rec g_lf[LFN];
 __attribute__((weak)) void dm_longframe_note(const char *what) { LOG("[longframe] %s", what); }   // Default (graphics unit tests); the strong definition in the host's diag.c adds scene context and writes perf.txt
-extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
+extern uint64_t mtl_arch_held_sub_ns(void); extern void mtl_create_ns(uint64_t *lib_ns, uint64_t *pso_ns); extern void mtl_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none); extern uint64_t mtl_upload_bytes(void); extern void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 static const char *const g_tname[6] = {"frame time", "frame work", "NVN submit+present", "GPU", "translation layer recording", "translation layer submit"};
 static void tpush(int k, double v) { g_tw[k][g_tn[k]++ % TWIN] = v; }
 // Thermal attribution (iOS DM_HEAT): per-frame GPU milliseconds are kept in a separate ring, taking the mean / p95 "since the last read" (at most the last HRN frames), without interfering with the timing summary's 300-frame window
@@ -2772,6 +2772,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             lf_rec *r = &g_lf[f % LFN]; r->f = f; r->fr = fr; r->nv = nv; r->t_s = (now_ns() - g_t0_ns) / 1e9; r->pso = (unsigned)(pso_ - ppso); r->lib = (unsigned)(lib_ - plib);
             r->make_ms = ((lns - plns) + (pns - ppns)) / 1e6; r->up = (unsigned)(up - pup); r->rup = (unsigned)(rup - prup); r->up_mb = (ub - pub) / 1048576.0; r->up_ms = up_ms;
             r->hy = (unsigned)(hy - phy); plns = lns; ppns = pns; pup = up; prup = rup; pub = ub; phy = hy;
+            { static uint64_t phl; uint64_t hl = mtl_arch_held_sub_ns(); r->held_ms = (hl - phl) / 1e6; phl = hl; }
         }
         plib = lib_; ppso = pso_;
         trow(f, "@t_s", (now_ns() - g_t0_ns) / 1e9);
@@ -2789,6 +2790,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
           if (on && r->f == f - 8 && f - 8 > 0 && (lf || lg)) { char b[512];
               snprintf(b, sizeof b, "frame %llu (%.2f s) whole frame %.1f ms, submit+present %.1f ms, GPU %.1f ms; new pipelines %u + shader libraries %u, %.1f ms in all; texture uploads %u first + %u re-uploads, %.1f MB / %.1f ms; draws with a hybrid pipeline %u",
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms, r->hy);
+              if (r->held_ms >= 0.1) { size_t bl = strlen(b); snprintf(b + bl, sizeof b - bl, "; pipeline lookups held by archive writes %.1f ms", r->held_ms); }   // ser_compile_enter: a write of the pipeline archive held them
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               dm_longframe_note(b); } }
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }

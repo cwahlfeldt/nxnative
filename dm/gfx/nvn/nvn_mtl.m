@@ -9686,7 +9686,8 @@ static nvn_hmap g_pbase_miss = {.klen = sizeof(pbase_key)};
 // Only callers for the same base wait on this group; unrelated bases compile in parallel.
 // compiled: its owner asked the compiler (a compile 0 owner only looks in the archive, and a waiter that needs the base builds it itself when that found none).
 // looked: left once the owner has looked in the archives (or skipped them for a base known missing), found: the base that found, set before; a compile 0 waiter waits on it
-@interface PbaseBuild : NSObject { @public dispatch_group_t done, looked; id<MTLRenderPipelineState> ps, found; NSError *error; int compiled; } @end
+// t_new / t_look0 / t_look1: when the owner made the job and began and ended its archive search (bp_now); cpu_look: the owner's CPU time in that search; qos: the owner's QoS class (DM_PSO_WAITLOG)
+@interface PbaseBuild : NSObject { @public dispatch_group_t done, looked; id<MTLRenderPipelineState> ps, found; NSError *error; int compiled; uint64_t t_new, t_look0, t_look1, cpu_look; int qos; } @end
 @implementation PbaseBuild @end
 static nvn_hmap g_pbase_pending = {.klen = sizeof(pbase_key)};
 static os_unfair_lock g_pbase_lock = OS_UNFAIR_LOCK_INIT;
@@ -9993,11 +9994,15 @@ static pthread_mutex_t g_ser_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_ser_cv = PTHREAD_COND_INITIALIZER;
 static int g_ser_compiles, g_ser_plain, g_ser_want;   // compiles under way, those without a capture period, serializations waiting or under way
 static _Atomic uint64_t g_ser_held_ns, g_ser_holds;   // compiles held back by a serialization: time in all, how many
+static _Thread_local int g_tl_sub_look;   // this thread is in the submit thread's pipeline lookup (pso_look_sub)
+static _Atomic uint64_t g_ser_held_sub_ns;   // of g_ser_held_ns, the time those lookups were held (the long-frame line, mtl_arch_held_sub_ns)
+uint64_t mtl_arch_held_sub_ns(void) { return atomic_load(&g_ser_held_sub_ns); }
 static void ser_compile_enter(int plain) {
     pthread_mutex_lock(&g_ser_mu);
     if (g_ser_want) {
         uint64_t t0 = bp_now(); while (g_ser_want) pthread_cond_wait(&g_ser_cv, &g_ser_mu);
-        atomic_fetch_add(&g_ser_held_ns, bp_now() - t0); atomic_fetch_add(&g_ser_holds, 1);
+        uint64_t dt = bp_now() - t0; atomic_fetch_add(&g_ser_held_ns, dt); atomic_fetch_add(&g_ser_holds, 1);
+        if (g_tl_sub_look) atomic_fetch_add(&g_ser_held_sub_ns, dt);
     }
     g_ser_compiles++; g_ser_plain += plain; pthread_mutex_unlock(&g_ser_mu);
 }
@@ -10540,11 +10545,30 @@ void mtl_arch_save(int wait_ms, int ending) {
 static void arch_at_exit(void) { mtl_warm_stop(); mtl_arch_save(MTL_QUIT_ARCH_MS, 1); }
 // What the harvest queue holds captured, then a flush, then every period handed over is written (not on g_arch_q, which writes them, nor on the harvest queue)
 static void arch_flush_wait(void) { arch_harvest_wait(DISPATCH_TIME_FOREVER); arch_flush(); if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER); }
-static void arch_note_new(void) {   // a base was compiled: flush 10 s later (one flush for a burst of them)
-    if (!g_arch_q || atomic_exchange(&g_arch_sched, 1)) return;
+// A base was compiled: the period is flushed once no base has come for ARCH_QUIET_NS, or ARCH_QUIET_MAX_NS after the first one not written, whichever is first (one flush for a
+// burst of them). A write holds back every compile (ser_compile_enter, Metal's race), the submit thread's specialization of a draw's pipeline among them, for as long as it takes:
+// flushed 10 s after a burst's first base, the write came in the middle of the burst, while the draws that brought it still asked for pipelines (Ocarina of Time's Lon Lon Ranch
+// on a base M5: 57 bases, 19 MB written in 284-291 ms, a stand-in's specialization held 140-208 ms, the frame 165-224 ms; docs/reference/rendering.md, "A pipeline archive write
+// holds the draw's specialization")
+enum { ARCH_QUIET_S = 10, ARCH_QUIET_MAX_S = 60 };
+static _Atomic uint64_t g_arch_new_last, g_arch_new_first;   // bp_now of the last base compiled and of the first not written yet (0: none)
+static void arch_flush_quiet(void) {   // on g_arch_q, from arch_note_new's timer
+    uint64_t now = bp_now(), last = atomic_load(&g_arch_new_last), first = atomic_load(&g_arch_new_first);
+    const uint64_t quiet = ARCH_QUIET_S * NSEC_PER_SEC, cap = ARCH_QUIET_MAX_S * NSEC_PER_SEC;
+    if (first && now - last < quiet && now - first < cap) {   // bases still coming: look again once it has been quiet that long, or at the cap
+        uint64_t wait = MIN(last + quiet - now, first + cap - now);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)wait), g_arch_q, ^{ arch_flush_quiet(); });
+        return;
+    }
+    atomic_store(&g_arch_new_first, 0); atomic_store(&g_arch_sched, 0); arch_flush();
     // during a prewarm the game plays through, the flush waits for the period's age (arch_warm_flush_due): look again 10 s later while captures wait, new ones or not
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ atomic_store(&g_arch_sched, 0); arch_flush();
-        if (atomic_load(&g_warm_running) && atomic_load(&g_warm_bg) && atomic_load(&g_arch_new) > 0) arch_note_new(); });
+    if (atomic_load(&g_warm_running) && atomic_load(&g_warm_bg) && atomic_load(&g_arch_new) > 0) arch_note_new();
+}
+static void arch_note_new(void) {
+    uint64_t now = bp_now(), none = 0;
+    atomic_store(&g_arch_new_last, now); atomic_compare_exchange_strong(&g_arch_new_first, &none, now);
+    if (!g_arch_q || atomic_exchange(&g_arch_sched, 1)) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ARCH_QUIET_S * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ arch_flush_quiet(); });
 }
 static void arch_compact_finish(void) {   // after every period that may hold recaptured bases is written (arch_write): the old files go once their bases are in the new ones
     if (!g_compact_files || !g_compacted) return;
@@ -10627,7 +10651,9 @@ static MTL4RenderPipelineDescriptor *spec_desc(id base, _Atomic int *own) {   //
 static _Atomic int g_spec_own;
 // The pipeline pso_desc describes: its base (built, from the archive or already made), then specialized with its colour state. Called on several threads.
 // compile 0: nil on an archive miss (*e untouched), with no MTLDevice fallback. Prewarm compaction may still refresh a found base for serialization.
+static _Thread_local uint64_t g_tl_look_ns, g_tl_spec_ns;   // this thread's last pso_build_ex: its archive search and its specialization (pso_look_sub's log)
 static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, int off, NSError **e, int compile) {
+    g_tl_look_ns = g_tl_spec_ns = 0;
     // Do not send conflicting or non-renderable aspect formats to Metal, which can
     // abort instead of returning an NSError (also on the MTLDevice fallback).
     if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) {
@@ -10666,7 +10692,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
             if (known && !compile) { os_unfair_lock_unlock(&g_pbase_lock); return nil; }
             job = hm_get_id(&g_pbase_pending, &bk);
             if (!job) {
-                job = [PbaseBuild new]; job->done = dispatch_group_create(); job->looked = dispatch_group_create();
+                job = [PbaseBuild new]; job->done = dispatch_group_create(); job->looked = dispatch_group_create(); job->t_new = bp_now(); job->qos = (int)qos_class_self();
                 dispatch_group_enter(job->done); dispatch_group_enter(job->looked); hm_put_id(&g_pbase_pending, &bk, job); owner = 1;
             }
         }
@@ -10676,7 +10702,15 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
         // Returning nil at once, as before, sent a draw that came while a background worker (pso_bg_look, hy_base_kick) looked up its pulling base to no stand-in and then
         // to a compile of its own base on the submit thread: Ocarina of Time on an iPhone 17, first visits to Hyrule Field and Kakariko, one draw 0.3-1.8 s ("draws that waited:
         // pulling base not made yet"), while every lookup the workers made found its base
-        if (!compile) { dispatch_group_wait(job->looked, DISPATCH_TIME_FOREVER); base = job->found; if (base) break; return nil; }
+        if (!compile) {
+            uint64_t w0 = bp_now(); dispatch_group_wait(job->looked, DISPATCH_TIME_FOREVER); uint64_t w = bp_now() - w0;
+            static int lg = -1; if (lg < 0) { const char *ev = getenv("DM_PSO_WAITLOG"); lg = ev && !strcmp(ev, "1") ? 60 : 0; }
+            if (lg > 0 && w > 5000000) { lg--;   // the owner's search: how long after it made the job it began, how long it took, and how much of that it ran
+                MLOG("pipeline base wait %.1f ms for another thread's archive search (waiter QoS %#x; owner QoS %#x, began %.1f ms after the job, search %.1f ms wall / %.1f ms CPU, %s)",
+                     w / 1e6, (unsigned)qos_class_self(), (unsigned)job->qos, job->t_look0 ? (job->t_look0 - job->t_new) / 1e6 : -1.0, job->t_look1 ? (job->t_look1 - job->t_look0) / 1e6 : -1.0,
+                     job->cpu_look / 1e6, job->found ? "found" : "not found"); }
+            base = job->found; if (base) break; return nil;
+        }
         dispatch_group_wait(job->done, DISPATCH_TIME_FOREVER); base = job->ps;
         if (base) break;
         if (job->compiled) { if (e) *e = job->error; return nil; }
@@ -10686,8 +10720,9 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
     else {
         uint64_t t0 = bp_now();
         int vd = 0; for (int i = 0; i < 31 && !vd; i++) vd = bk.va[i][0] != 0;   // a vertex layout (MTLVertexFormatInvalid is 0)
+        uint64_t c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID); job->t_look0 = t0;
         int from_run = 0; base = known ? nil : arch_lookup(b, vd, &from_run);
-        uint64_t t1 = bp_now();
+        uint64_t t1 = bp_now(); job->t_look1 = t1; job->cpu_look = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0; g_tl_look_ns = t1 - t0;
         if (base) { g_pb_archived++; g_pt_hit_n++; g_pt_hit_ns += t1 - t0; }
         job->found = base; dispatch_group_leave(job->looked);   // before the compaction's capture below, which compiles
         if (base && from_run && g_compact_enabled && atomic_load(&g_warm_running)) {
@@ -10722,7 +10757,7 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
     for (int i = 0; i < 8; i++) pso_col4(s.colorAttachments[i], d.colorAttachments[i]);
     id<MTLRenderPipelineState> ps = plain_spec(s, base, e);
     if (ps) g_pb_spec++;
-    g_pt_spec_ns += bp_now() - ts;
+    g_pt_spec_ns += bp_now() - ts; g_tl_spec_ns = bp_now() - ts;
     return ps;
 }
 static id<MTLRenderPipelineState> pso_build(MTLRenderPipelineDescriptor *d, int off, NSError **e) { return pso_build_ex(d, off, e, 1); }   // off: !pso_key.border of the key d was made from
@@ -10918,12 +10953,22 @@ static void hy_base_kick(MTLRenderPipelineDescriptor *d, int off) {
     int fresh = ![g_hy_kick_set containsObject:kd]; if (fresh) [g_hy_kick_set addObject:kd]; os_unfair_lock_unlock(&g_hy_lock);
     if (fresh) { g_hy_kicked++; dispatch_async(pp_bg_queue(), ^{ NSError *be = nil; (void)pso_build(d, off, &be); }); }
 }
+// A pipeline the submit thread takes without compiling (pso_build_ex(..., 0)): its base made, or found in the archives here. DM_PSO_WAITLOG=1 logs one that took more than 5 ms
+static id<MTLRenderPipelineState> pso_look_sub(MTLRenderPipelineDescriptor *d, int off, NSError **e, const char *what, NvShader *vs, NvShader *fs) {
+    uint64_t t0 = bp_now(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID);
+    g_tl_sub_look = 1; id<MTLRenderPipelineState> ps = pso_build_ex(d, off, e, 0); g_tl_sub_look = 0;
+    uint64_t w = bp_now() - t0;
+    static int lg = -1; if (lg < 0) { const char *ev = getenv("DM_PSO_WAITLOG"); lg = ev && !strcmp(ev, "1") ? 80 : 0; }
+    if (lg > 0 && w > 5000000) { lg--; MLOG("pipeline lookup on the submit thread %.1f ms wall / %.1f ms CPU (%s, %s; archive search %.1f ms, specialization %.1f ms): vertex %s fragment %s", w / 1e6,
+                                            (clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0) / 1e6, what, ps ? "found" : "not found", g_tl_look_ns / 1e6, g_tl_spec_ns / 1e6, vs ? vs->key : "-", fs ? fs->key : "-"); }
+    return ps;
+}
 static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *k, NvShader *vs, NvShader *fs) {
     __unsafe_unretained id<MTLRenderPipelineState> h = hm_get_id(&g_pso_hy, k);
     if (h) return h;
     MTLRenderPipelineDescriptor *d = vs->has_pull ? pso_desc_pull(k, vs, fs) : nil;
     if (!d) return nil;
-    NSError *e = nil; int off = !k->border; id<MTLRenderPipelineState> ps = pso_build_ex(d, off, &e, 0);
+    NSError *e = nil; int off = !k->border; id<MTLRenderPipelineState> ps = pso_look_sub(d, off, &e, "stand-in", vs, fs);
     if (!ps) { hy_base_kick(d, off); g_hy_none++; return nil; }
     g_hy_made++; hm_put_id(&g_pso_hy, k, ps);
     return ps;
@@ -11341,7 +11386,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
         int st = pso_pend_try(&k, &ps);
         if (st == 2) took = 1;   // built in the background (nil: it failed, and is built again below for its message)
         else {
-            if (st == 0) ps = pso_build_ex(pso_desc(&k, vs, fs, nil, 0), !k.border, &e, 0);   // its base made or archived: no compile
+            if (st == 0) ps = pso_look_sub(pso_desc(&k, vs, fs, nil, 0), !k.border, &e, "own", vs, fs);   // its base made or archived: no compile
             if (!ps) {
                 // Demand first (main's order): the draw's own pipeline is queued before the prediction admits speculative builds; with a stand-in nothing waits for it
                 __unsafe_unretained id<MTLRenderPipelineState> h = hybrid_get(&k, vs, fs);
