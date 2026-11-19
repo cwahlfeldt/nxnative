@@ -10,7 +10,7 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** `out.wad.nx` has a span table and a name table. Its `.vfp.nx` members store the GLSLC headers, control sections and code in separate arrays.
 - **Fix:** the splitter maps `out.wad.nx` with the `WAD\x01` signature and reads its `.vfp.nx` members. It checks the name table and shader member ranges, requires non-empty code and complete coverage of the VFP arrays, then passes the original control and code bytes to the existing shader checks. The VFP arrays give individual stages. Their vertex and pixel pairing is unknown.
 - **Check:** `dm/gfx/tests/test_noire_shader.py` checks keys and bytes in both RomFS forms, the signature and basename gate, and rejection of truncated directories, invalid names and malformed spans. On M4 Pro/macOS 27.2.1, the WAD yielded zero shaders with `a6aaf66d` and 8,933 with the reader. A full split with the reader and the startup captures found 8,968 shaders, all of which compiled for the Mac.
-- **Found on:** L.A. Noire 1.2 (`0100830004FB6000`), [NX2Apple issue #1386](https://github.com/LNPANDY/NX2Apple/issues/1386). The Mac build with the [direct `irs` service fix](services.md#direct-irs-connection-and-status-memory) loaded the 8,968-entry map. Captures show the officers' faces, uniforms and badges in the opening patrol-car scene and on foot at the first intersection. In “Upon Reflection,” the player confirmed that the alley characters' materials rendered correctly and the notebook pages were readable on the same M4 Pro/macOS 27.2.1 build.
+- **Found on:** [L.A. Noire 1.2](../../dm/games/0100830004FB6000/README.md#mac-validation) ([NX2Apple issue #1386](https://github.com/LNPANDY/NX2Apple/issues/1386)).
 
 ### Firaxis CIVBSF shader libraries
 
@@ -113,6 +113,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Cause:** a worker's exception (and `red()`, a `SystemExit`) ended the whole split through the process pool, so one archive of a format revision a reader does not know stopped every other file's shaders too. `nlg_dict` read its index without checking the layout, so an index of another revision gave an `IndexError` instead of a line naming the archive.
 - **Fix:** `scan_file` leaves out a file whose reader fails, with `[RED] <file>: <why> (its shaders are left out)`, and the split goes on; at the end it prints `[RED] <n> file(s) could not be read, their shaders are left out (first: …)` and writes its tables. The NSP script shows that line and packs a provisional profile's IPA without those shaders; for a registered profile it stops there, since the profile's tables were split from every file. `nlg_dict` checks that the records and chunks fit the index and every chunk index is in range before reading it. The format itself still needs a reader: the line names the archive and, for NLG, its header bytes.
 - **Found on:** Mario Strikers: Battle League (no profile; [seedds/nxnative#282](https://github.com/seedds/nxnative/pull/282)): one of its 879 Next Level Games archives, a revision `nlg_dict` does not read. That revision is read now: [Next Level Games archives of revision 4](#next-level-games-archives-of-revision-4).
+
+### A large NXCX texture archive stalls the shader split
+
+- **Symptom:** the split stays at 99% for many minutes and the remaining worker consumes nearly all memory on a 16 GB Mac.
+- **Cause:** the generic loose-file scanner reads the entire 15.6 GiB `w_allpac.mrg` into a Python bytes object and searches it repeatedly for embedded formats. Byte sequences that happen to match shader magics occur inside compressed textures and trigger extra searches.
+- **Fix:** for an `NXCX` texture archive, look for embedded signatures in overlapping 16 MiB chunks. Pass GLSLC candidate offsets to the existing validator through a read-only mapping. If a signature indicates another supported embedded format, use the ordinary loose-file scanner.
+- **Found on:** [TSUKIHIME A piece of blue glass moon](../../dm/games/010057A01E4D4000/README.md) 1.0.2. The full split finished in 77–80 seconds on a 16 GB Apple M6 Mac mini with the files on S790. The original run was stopped after 19 minutes 55 seconds and its worker peaked at a 15.6 GiB physical footprint. The original reader, run against the large archive using a mapping for comparison, also found zero shaders there.
+- **Check:** `dm/tools/tests/test_split_nxcx.py` compares both paths for a valid GLSLC record whose magic crosses the chunk boundary, and checks that a BNSH signature takes the ordinary path.
 
 ### Next Level Games archives of revision 4
 
