@@ -29,6 +29,12 @@
 // rise set k to kmin with no grace, so three frames late while the clock rose stepped up again, with cref dropped at the cap change and a GPU reference taken at the 30 fps
 // cap: neither the fit trial (a GPU-bound cost near FSTEP_FIT) nor a probe brought kmin back (t_fstep: the movie and thermal cap cases). A cref kept from before the cap
 // starts a probe only when the cost at the longer hold is within FSTEP_SAME of it, and a failed probe doubles the hold-off as any other does.
+// A frame the caller marks as one-time load work (s->stall: first texture uploads, pipelines or shader libraries made on the spot, draws with a hybrid pipeline) is paid back
+// like any late frame, but its lateness is not the scene's rate: it neither counts toward the three late frames in a row nor toward the window's average, and its cost is not
+// what the step goes to. An area load is a burst of such frames, several in 30, and passed both tests above: Ocarina of Time entering Castle Town's entrance on a base M5
+// stepped 1 → 3 on its load frames (48–135 ms, hundreds of first uploads each), then held 20 fps for 52 frames and 30 for 33 more while frames took 0.69 vsyncs, about
+// 3.5 s after every load. A scene that loads in most of its frames is its rate, though: while more than FSTEP_STALL_MAX of the last FSTEP_RUN frames were marked, they are
+// judged as any other (a scene that streams every frame and does not fit hold 1 still steps to a steady 30, not a 45 fps judder).
 #pragma once
 #include <math.h>
 #include <stdint.h>
@@ -52,6 +58,7 @@
 // second half cost at most 1 − FSTEP_RAMP of its first half, and had a late frame (a window on time is judged as a trial), starts another, up to FSTEP_PROBE_MAX frames in all
 #define FSTEP_RAMP 0.05       // the fall in cost from one half of a grace window to the next that shows the clock still rising (the per-frame noise of a 25 ms frame is 4%, of 15 frames 1%)
 #define FSTEP_PROBE_MAX 180   // grace frames a probe may take in all (3 s at 60 fps): a clock that keeps rising without reaching the hold is not waited for longer
+#define FSTEP_STALL_MAX 15    // marked load frames among the last FSTEP_RUN beyond which they are judged as the scene's rate (an area load marked at most 9 of 30)
 
 typedef struct {
     int k, step;              // vsyncs each frame stays on screen; the step handed to the game for the next frame (k, or k + 1 while paying back)
@@ -76,7 +83,9 @@ typedef struct {
     double last_cost[3];      // the last three frames' costs, oldest first
     int smax;                 // set by the caller: the largest step the game takes (its stub's STEP_MAX; 0 = FSTEP_MAX)
     int no_payback;           // set by the caller: 1 = the game does not take the step (120 fps: it steps by its target), so three late frames raise the hold whatever the average
-    uint64_t late, paid, ups, downs, failed, probes; double dropped;   // statistics for the log
+    int stall;                // set by the caller before each call, then cleared: 1 = the frame did one-time load work, whose lateness is paid back but is not the scene's rate
+    uint32_t stall_bits;      // the last FSTEP_RUN frames' stall marks, newest in bit 0
+    uint64_t late, paid, ups, downs, failed, probes, stalls; double dropped;   // statistics for the log (stalls: late frames taken as load work)
 } nvn_fstep;
 
 // A drain of frames standing in the display link's queue in a frame's time (hle_nvn.c fstep_tick, g_fs_drain; nvn_link_drain.h): the acquire waited extra link ticks while the
@@ -107,6 +116,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (kmin > smax) kmin = smax;
     if (kmax < kmin) kmax = kmin;
     if (!s->hold) s->hold = hold0;
+    int stall = s->stall; s->stall = 0;
+    s->stall_bits = (s->stall_bits << 1 | (stall != 0)) & ((1u << FSTEP_RUN) - 1);
+    if (__builtin_popcount(s->stall_bits) > FSTEP_STALL_MAX) stall = 0;   // loading in most frames: the scene's rate
     if (fixed > 0) {   // the game's own step: speed is right by construction, nothing to pay back
         s->k = s->step = fixed < smax ? fixed : smax;
         s->debt = 0; s->late_run = s->fit_run = s->trial = s->probe = s->grace = s->tpend = 0; s->run = 0;
@@ -117,8 +129,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     int held = s->k;   // the frame that just ended stayed on screen this long
     if (held != s->over_k) { s->over_k = held; s->over_sum = 0; s->over_i = 0; memset(s->over, 0, sizeof s->over); }   // judged against the hold in force, not the frames before a step
     double over = shown - held; if (over < -1) over = -1; if (over > FSTEP_SHORT_MAX) over = FSTEP_SHORT_MAX;
+    if (stall && over > 0) over = 0;   // a load frame counts as on time toward the average
     s->over_sum += over - s->over[s->over_i]; s->over[s->over_i] = over; s->over_i = (s->over_i + 1) % FSTEP_RUN;
-    s->last_cost[0] = s->last_cost[1]; s->last_cost[1] = s->last_cost[2]; s->last_cost[2] = cost;
+    if (!stall) { s->last_cost[0] = s->last_cost[1]; s->last_cost[1] = s->last_cost[2]; s->last_cost[2] = cost; }   // the step goes to the scene's cost, not a load's
     s->debt += shown - s->step;
     if (s->debt > FSTEP_DEBT_MAX) { s->dropped += s->debt - FSTEP_DEBT_MAX; s->debt = FSTEP_DEBT_MAX; }
     if (s->debt < -1) s->debt = -1;   // ahead (a frame shorter than its step): nothing slows the game down, so at most one vsync is remembered
@@ -137,7 +150,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         s->plate += late; s->ptotal++;
         if (!--s->grace && s->ramp && s->plate && s->ptotal + FSTEP_GRACE <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = FSTEP_GRACE; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
     }
-    if (late) { s->late++; s->late_run = grace ? 0 : s->late_run + 1; s->fit_run = 0; } else s->late_run = 0;
+    if (late) { s->late++; s->stalls += stall != 0; s->late_run = grace ? 0 : stall ? s->late_run : s->late_run + 1; s->fit_run = 0; } else s->late_run = 0;   // a load frame neither adds to the run nor ends it
     // The cost of the frames on time (a hitch is not what the scene costs): at kmin, and at the longer hold
     if (kmin != s->ckmin) {   // another cap: its run starts over, and what held it before comes back
         if (s->ckmin >= 1 && s->ckmin <= FSTEP_MAX) {

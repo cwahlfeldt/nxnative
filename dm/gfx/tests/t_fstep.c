@@ -18,6 +18,11 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
     }
 }
 
+// n frames as run, each marked as one-time load work (nvn_fstep.stall) or not
+static void run_marked(sim *m, int n, double w, int kmin, int kmax, int mark) {
+    for (int i = 0; i < n; i++) { m->s.stall = mark; run(m, 1, w, kmin, kmax, 0); }
+}
+
 // A hitch that steps hold 1 up: seven frames of 1.6 vsyncs (pipeline compiles), 4.2 vsyncs behind in the last 30 frames and 3.6 without the longest, more than FSTEP_LATE a frame on average. Three such
 // frames among frames on time are paid back by the step and keep hold 1 (below)
 static void hitch(sim *m) { run(m, 7, 1.6, 1, 3, 0); }
@@ -72,6 +77,32 @@ int main(void) {
         check(s.ups == 0 && at2 == 0, b);
         snprintf(b, sizeof b, "  game time %.0f against real time %.2f (debt %.2f)", game, real, s.debt);
         check(real - game - s.debt > -1.01 && real - game - s.debt < 1.01, b);
+    }
+    {   // An area load (Ocarina of Time into Castle Town's entrance on a base M5, frames 3519-3560 of a recorded run, the cost of each at hold 1): frames of 294, 48, 31, 99,
+        // 135, 27, 42 and 107 ms, hundreds of first texture uploads in each, in a scene of 0.7 vsyncs. Unmarked they step hold 1 to 3 (20 fps for 52 frames on the Mac); marked
+        // as the caller marks them (load work, and the frame after, whose cost has the load frame's GPU time) they are paid back and hold 1 stays
+        static const double burst[] = {0.6, 16.9, 1.9, 0.9, 0.6, 0.6, 0.5, 0.4, 0.4, 0.4, 0.3, 0.3, 0.9, 2.9, 2.4, 1.9, 5.9, 8.1, 1.6, 2.5, 1.9,
+                                       0.7, 0.7, 0.7, 0.8, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 4.1, 1.8, 1.5};
+        static const int load[] = {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0};
+        for (int use = 0; use < 2; use++) {
+            sim m = {0}; run(&m, 900, 0.7, 1, 3, 0); int at_up = 0;
+            for (unsigned i = 0; i < sizeof burst / sizeof *burst; i++) run_marked(&m, 1, burst[i], 1, 3, use && (load[i] || (i && load[i - 1])));
+            for (int i = 0; i < 300; i++) { run(&m, 1, 0.7, 1, 3, 0); at_up += m.s.k > 1; }
+            if (!use) { snprintf(b, sizeof b, "an area load's burst, unmarked: steps up (ups %llu, %d of the next 300 frames above hold 1)", (unsigned long long)m.s.ups, at_up); check(m.s.ups >= 1 && at_up > 0, b); }
+            else {
+                snprintf(b, sizeof b, "  marked as load work: hold 1 throughout (ups %llu, %llu late frames taken as load)", (unsigned long long)m.s.ups, (unsigned long long)m.s.stalls);
+                check(m.s.ups == 0 && at_up == 0 && m.s.stalls >= 8, b);
+                snprintf(b, sizeof b, "  game time %.0f against real time %.2f (debt %.2f, dropped %.1f)", m.game, m.real, m.s.debt, m.s.dropped);
+                check(m.real - m.game - m.s.debt - m.s.dropped > -1.01 && m.real - m.game - m.s.debt - m.s.dropped < 1.01, b);
+            }
+        }
+        sim h = {0}; run(&h, 120, 0.5, 1, 3, 0);   // the scene itself does not fit: a load every other frame does not hide the late frames between them
+        for (int i = 0; i < 300; i++) run_marked(&h, 1, 1.3, 1, 3, i % 2);
+        snprintf(b, sizeof b, "a scene at 1.3 vsyncs loading every other frame: 30 fps (k %d, ups %llu)", h.s.k, (unsigned long long)h.s.ups);
+        check(h.s.k == 2 && h.s.ups == 1, b);
+        sim t = {0}; run(&t, 120, 0.5, 1, 3, 0); run_marked(&t, 300, 1.3, 1, 3, 1);   // loading in every frame: past FSTEP_STALL_MAX the marks are the scene's rate
+        snprintf(b, sizeof b, "a scene at 1.3 vsyncs loading in every frame: 30 fps, not a judder at hold 1 (k %d)", t.s.k);
+        check(t.s.k == 2, b);
     }
     {   // a scene at 1.3 vsyncs whose twelfth late frame is a 50 ms hitch: the step goes to the cheapest of the last three (2), not to the hitch (3)
         sim m = {0}; run(&m, 120, 0.5, 1, 3, 0); run(&m, 11, 1.3, 1, 3, 0);
