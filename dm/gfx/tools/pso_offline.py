@@ -53,6 +53,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import romfs, shader_lib   # the libraries may be one file (shader_lib.py), read in place; metal-tt alone needs files of its own (real_libraries)
 import dmsh_abi as abi, dmsh_side
 import vol_space   # the space metal-tt may write, with what APFS frees on demand
+import mesh_rows   # the task / mesh pipelines of the game's own programs the prewarm lists do not record
 
 # The function constants the host's prebuild sets in a base's functions (nvn_mtl.m pre_fn), by name: (index, bool value). A pair whose functions declare another constant is left to the
 # device: the host leaves it at its default, which metal-tt can do too, but no other constant was tried there, and one function metal-tt fails fails its whole group
@@ -788,6 +789,9 @@ def update_prewarm(a, lib_dir, out, work, archs, zero):
     """Validate the independent prewarm cache even when the pair archive uses its fast path. The Mac packer's separate mac_prebake stage owns its files when no host is supplied here"""
     if a.platform == 'macos' and not a.prewarm_host: return
     rows = prewarm_rows(a.manifest) if a.prewarm_host else ''
+    if rows and a.shader_map:   # and every mesh / pixel pair of the game's programs with a task and render states the lists show (mesh_rows.py): built here, found in the bundle by their key
+        extra, summary = mesh_rows.extra_rows(a.shader_map[0], rows)
+        if extra: rows += extra; print('pso_offline: prewarm: ' + ', '.join(f'{k} {v}' for k, v in summary.items()) + ' (mesh_rows.py)')
     prewarm = 'none (no --prewarm-host)' if not a.prewarm_host else 'none (the prewarm lists have no R or M rows)'
     if rows and not Path(a.prewarm_host).is_file(): prewarm = f'none (no host at {a.prewarm_host})'; print(f'[RED] pso_offline: prewarm: no host at {a.prewarm_host}: the device builds the prewarm lists\' pipelines')
     if rows and Path(a.prewarm_host).is_file():

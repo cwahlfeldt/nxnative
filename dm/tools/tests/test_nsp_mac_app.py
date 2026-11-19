@@ -1168,7 +1168,9 @@ class Script(unittest.TestCase):
         e = self.tool_env; assert e is not None
         self.assertEqual((e['DM_PSO_PREBUILD'], e['DM_PSO_ARCHIVE'], e['DM_PSO_PREBUILD_OUT'], e['DM_PSO_BUNDLE'], e['DM_MSL_DIR'], e['DM_NVN_SHMAP'], e['DM_PSO_PREBUILD_DEPTH'], e['DM_PSO_MANIFEST']),
                          ('tool', str(tmp / 'pso/mac-prewarm-work'), str(tmp / 'pso/mac-prewarm'), str(tmp / 'pso/mac'), str(tmp / 'shader/cache'), str(tmp / 'profile/shader_map.tsv'), 'zero',
-                          str(tmp / 'profile/pso_manifest.tsv')))
+                          str(tmp / 'pso/prebake_list.tsv')))
+        # the tool's own list: the profile's rows, then the mesh rows of the game's programs (mesh_rows.py; none here); the profile's list, which the app ships, is as it was
+        self.assertEqual((tmp / 'pso/prebake_list.tsv').read_text(), (tmp / 'profile/pso_manifest.tsv').read_text())
         self.assertEqual(o['--pso'], str(tmp / 'pso/mac'))
         self.assertEqual(sorted(p.name for p in (tmp / 'pso/mac').iterdir()),
                          ['applegpu_g14s-prewarm-00.keys', 'applegpu_g14s-prewarm-00.mtl4a', 'applegpu_g14s-prewarm-01.keys', 'applegpu_g14s-prewarm-01.mtl4a',

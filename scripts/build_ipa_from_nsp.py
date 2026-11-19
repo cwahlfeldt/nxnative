@@ -2942,6 +2942,12 @@ def mac_prebake(py, repo, work, msl, g, host, pso, env, logs):
     if pso is None: return pso   # no pair archive (none for this Mac's GPU, or --gpu none): the app has no bundle to put them in
     manifest = g.table('pso_manifest.tsv')
     text = manifest.read_text() if manifest.is_file() else ''
+    # Every mesh / pixel pair of the game's programs with a task and render states the list shows (dm/gfx/tools/mesh_rows.py): a mesh pipeline has no stand-in, so the bundle
+    # holds them all; the tool builds them from a list of its own, and the list shipped in the app stays as recorded
+    sys.path.insert(0, str(repo / 'dm/gfx/tools')); import mesh_rows
+    extra, mesh_summary = mesh_rows.extra_rows(g.table('shader_map.tsv'), text) if text else ('', {})
+    if extra: say('prewarm pipelines: ' + ', '.join(f'{k} {v}' for k, v in mesh_summary.items()) + ' of the game\'s own task / mesh programs (mesh_rows.py)')
+    text += extra
     rows = sum(ln.startswith(('R\t', 'M\t')) for ln in text.splitlines())
     def none(why):   # the app goes without them: none of an earlier build's stay in pso (pso_offline.py leaves an architecture's there)
         say(why); drop_prewarm(pso); return pso
@@ -2970,7 +2976,8 @@ def mac_prebake(py, repo, work, msl, g, host, pso, env, logs):
             shutil.rmtree(out, ignore_errors=True)
             if not (stage_key.is_file() and stage_key.read_text().strip() == key): shutil.rmtree(stage, ignore_errors=True)   # an unfinished run of other inputs: its captures are not this build's
             stage.mkdir(parents=True, exist_ok=True); stage_key.write_text(key + '\n')
-            renv = dict(env, DM_PSO_PREBUILD='tool', DM_PSO_ARCHIVE=str(stage), DM_PSO_PREBUILD_OUT=str(out), DM_PSO_BUNDLE=str(pso), DM_PSO_MANIFEST=str(manifest),
+            listf = work / 'pso/prebake_list.tsv'; listf.write_text(text)   # the profile's list and the mesh rows (above), outside the tool's archive folder
+            renv = dict(env, DM_PSO_PREBUILD='tool', DM_PSO_ARCHIVE=str(stage), DM_PSO_PREBUILD_OUT=str(out), DM_PSO_BUNDLE=str(pso), DM_PSO_MANIFEST=str(listf),
                         DM_MSL_DIR=str(msl), DM_NVN_SHMAP=str(g.table('shader_map.tsv')))
             if zero: renv['DM_PSO_PREBUILD_DEPTH'] = 'zero'
             if not g.table('pso_pairs.tsv').is_file() and (work / 'shader/pso_pairs.tsv').is_file(): renv['DM_PSO_PAIRS'] = str(work / 'shader/pso_pairs.tsv')
